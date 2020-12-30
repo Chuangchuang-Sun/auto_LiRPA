@@ -13,7 +13,7 @@ from auto_LiRPA.utils import LinearBound, logger, eyeC, unpack_inputs, Patches, 
 
 
 class BoundedModule(nn.Module):
-    def __init__(self, model, global_input, bound_opts={}, auto_batch_dim=True, device='cpu', 
+    def __init__(self, model, global_input, bound_opts={}, auto_batch_dim=True, device='auto',
             verbose=False):
         super(BoundedModule, self).__init__()
         if isinstance(model, BoundedModule):
@@ -23,7 +23,7 @@ class BoundedModule(nn.Module):
         self.verbose = verbose
         self.bound_opts = bound_opts
         self.auto_batch_dim = auto_batch_dim
-        self.device = device
+        self.device = device if device != 'auto' else next(model.parameters()).device
         self.global_input = global_input
         if auto_batch_dim:
             # logger.warning('Using automatic batch dimension inferring, which may not be correct')
@@ -531,6 +531,22 @@ class BoundedModule(nn.Module):
         A_dict = {} if return_A else None
         if x is not None:
             self._set_input(*x, new_interval=new_interval)
+
+        # Several shortcuts.
+        method = method.lower() if method is not None else method
+        if method == 'ibp':
+            # Pure IBP bounds.
+            method = None
+            IBP = True
+        elif method == 'ibp+backward':
+            method = 'backward'
+            IBP = True
+        elif method == 'crown':
+            method = 'backward'
+        elif method == 'ibp+crown' or method == 'crown-ibp':
+            method = 'backward'
+            IBP = True
+
         if IBP and method is None and reuse_ibp:
             # directly return the previously saved ibp bounds
             return self.ibp_lower, self.ibp_upper
@@ -633,7 +649,7 @@ class BoundedModule(nn.Module):
                                         newC = Patches(None, 1, 0, [batch_size, node.default_shape[-2] * node.default_shape[-1], node.default_shape[-3], node.default_shape[-3], 1, 1], 1)
                                     elif isinstance(node, BoundAdd) and node.mode == "patches":
                                         num_channel = node.default_shape[-3]
-                                        patches = (torch.eye(num_channel)).unsqueeze(0).unsqueeze(0).unsqueeze(4).unsqueeze(5) # now [1 * 1 * in_C * in_C * 1 * 1]
+                                        patches = (torch.eye(num_channel, device=self.device)).unsqueeze(0).unsqueeze(0).unsqueeze(4).unsqueeze(5) # now [1 * 1 * in_C * in_C * 1 * 1]
                                         newC = Patches(patches, 1, 0, [batch_size] + list(patches.shape[1:]))
                                     else:
                                         newC = torch.eye(dim, device=self.device)\
