@@ -41,10 +41,11 @@ class BoundedModule(nn.Module):
             kwargs.pop("method_opt")
         else:
             opt = "forward" 
-        if "disable_multi_gpu" in kwargs:
-            kwargs.pop("disable_multi_gpu")
-        if "no_replicas" in kwargs:
-            kwargs.pop("no_replicas")
+        for kwarg in [
+                'disable_multi_gpu', 'no_replicas', 'get_property', 
+                'node_class', 'att_name']:
+            if kwarg in kwargs:
+                kwargs.pop(kwarg)
         if opt == "compute_bounds":
             return self.compute_bounds(**kwargs)
         else:
@@ -471,6 +472,9 @@ class BoundedModule(nn.Module):
         model.load_state_dict(self.ori_state_dict)
         delattr(self, 'ori_state_dict')
 
+        # The final node used in the last time calling `compute_bounds`
+        self.last_final_node = None
+
         logger.debug('NodesOP:')
         for node in nodesOP:
             logger.debug('{}'.format(node._replace(param=None)))
@@ -538,20 +542,20 @@ class BoundedModule(nn.Module):
             # Pure IBP bounds.
             method = None
             IBP = True
-        elif method == 'ibp+backward':
+        elif method == 'ibp+backward' or method == 'ibp+crown' or method == 'crown-ibp':
             method = 'backward'
             IBP = True
         elif method == 'crown':
             method = 'backward'
-        elif method == 'ibp+crown' or method == 'crown-ibp':
+        elif method == 'forward':
+            forward = True
+        elif method == 'forward+backward':
             method = 'backward'
-            IBP = True
+            forward = True
 
         if IBP and method is None and reuse_ibp:
             # directly return the previously saved ibp bounds
             return self.ibp_lower, self.ibp_upper
-        if method == 'forward':
-            forward = True
         root = [self._modules[name] for name in self.root_name]
         batch_size = root[0].fv.shape[0]
         dim_in = 0
@@ -594,14 +598,32 @@ class BoundedModule(nn.Module):
         # check whether weights are perturbed and set nonlinear for the BoundMatMul operation
         for n in self._modules.values():
             if isinstance(n, (BoundLinear, BoundConv, BoundBatchNormalization)):
+                n.nonlinear = False
                 for l_name in n.input_name[1:]:
                     node = self._modules[l_name]
                     if hasattr(node, 'perturbation'):
                         if node.perturbation is not None:
                             n.nonlinear = True
 
+        # BFS to find out whether each node is used given the current final node
+        if final != self.last_final_node:
+            self.last_final_node = final
+            for i in self._modules.values():
+                i.used = False
+            final.used = True
+            queue = deque([final])
+            while len(queue) > 0:
+                n = queue.popleft()
+                for n_pre_name in n.input_name:
+                    n_pre = self._modules[n_pre_name]
+                    if not n_pre.used:
+                        n_pre.used = True
+                        queue.append(n_pre)
+
         for i in self._modules.values(): # for all nodes
-            if hasattr(i, 'nonlinear') and i.nonlinear:  # if node.nonlinear
+            if not i.used:
+                continue
+            if hasattr(i, 'nonlinear') and i.nonlinear: 
                 for l_name in i.input_name:
                     node = self._modules[l_name]
                     if not hasattr(node, 'lower'):
@@ -623,7 +645,8 @@ class BoundedModule(nn.Module):
                                 node.lower = node.forward(self._modules[node.input_name[0]].lower)
                                 node.upper = node.forward(self._modules[node.input_name[0]].upper)
                             elif isinstance(node, BoundReshape) and \
-                                    hasattr(self._modules[node.input_name[0]], 'lower'):
+                                    hasattr(self._modules[node.input_name[0]], 'lower') and \
+                                    hasattr(self._modules[node.input_name[1]], 'value'):
                                 # Node for input value.
                                 val_input = self._modules[node.input_name[0]]
                                 # Node for input parameter (e.g., shape, permute)
@@ -657,7 +680,7 @@ class BoundedModule(nn.Module):
                                             .view(batch_size, dim, *node.default_shape[1:])
                                     if return_A:
                                         _, _, A_dict = self._backward_general(C=newC, node=node, root=root,
-                                                                              return_A=return_A, A_dict=A_dict)
+                                                                            return_A=return_A, A_dict=A_dict)
                                     else:
                                         self._backward_general(C=newC, node=node, root=root, return_A=return_A)
 
@@ -1101,7 +1124,9 @@ class BoundDataParallel(DataParallel):
             kwargs.pop("no_replicas")
 
         if not self.device_ids or disable_multi_gpu:
-            return self.module(*inputs, **kwargs)
+            if kwargs.pop("get_property", False):
+                return self.get_property(self, *inputs, **kwargs)
+            return self.module(*inputs, **kwargs)            
 
         if kwargs.pop("get_property", False):
             if self._replicas is None:

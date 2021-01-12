@@ -10,29 +10,9 @@ from auto_LiRPA.utils import MultiAverageMeter
 import torch.nn.functional as F
 from datasets import mnist_loaders
 import torchvision.datasets as datasets
+import models
 from auto_LiRPA.eps_scheduler import LinearScheduler, AdaptiveScheduler, SmoothedScheduler, FixedScheduler
 
-class mlp_3layer(nn.Module):
-    def __init__(self, in_ch=1, in_dim=28, width=1):
-        super(mlp_3layer, self).__init__()
-        self.fc1 = nn.Linear(in_ch * in_dim * in_dim, 64 * width)
-        self.fc2 = nn.Linear(64 * width, 64 * width)
-        self.fc3 = nn.Linear(64 * width, 10)
-
-        eps = 0.01
-        norm = 2
-        global ptb
-        ptb = PerturbationLpNorm(norm=norm, eps=eps)
-        self.fc1.weight = BoundedParameter(self.fc1.weight.data, ptb)
-        self.fc2.weight = BoundedParameter(self.fc2.weight.data, ptb)
-        self.fc3.weight = BoundedParameter(self.fc3.weight.data, ptb)
-
-    def forward(self, x):
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
 
 class Logger(object):
     def __init__(self, log_file=None):
@@ -76,10 +56,11 @@ parser.add_argument("--scheduler_opts", type=str, default="start=10,length=100",
 parser.add_argument("--bound_opts", type=str, default=None, choices=["same-slope", "zero-lb", "one-lb"],
                     help='bound options')
 parser.add_argument('--clip_grad_norm', type=float, default=8.0)
+parser.add_argument('--truncate_data', type=int, help='Truncate the training/test batches in unit test')
 
 
 args = parser.parse_args()
-exp_name = 'mlp_MNIST'+'_b'+str(args.batch_size)+str(args.bound_type)+'_epoch'+str(args.num_epochs)+'_'+args.scheduler_opts+'_'+str(args.eps)[:6]
+exp_name = 'mlp_MNIST'+'_b'+str(args.batch_size)+'_'+str(args.bound_type)+'_epoch'+str(args.num_epochs)+'_'+args.scheduler_opts+'_'+str(args.eps)[:6]
 if args.verify:
     logger = Logger(open(exp_name + '_test.log', "w"))
 else:
@@ -125,7 +106,6 @@ def Train(model, t, loader, eps_scheduler, norm, train, opt, bound_type, method=
             #     ub = cub * factor + iub * (1 - factor)
             # else:
             #     lb = clb * factor + ilb * (1 - factor)
-
         if loss_fusion:
             if isinstance(model, BoundDataParallel):
                 max_input = model(get_property=True, node_class=BoundExp, att_name='max_input')
@@ -140,6 +120,11 @@ def Train(model, t, loader, eps_scheduler, norm, train, opt, bound_type, method=
             return lb, robust_ce
 
     for i, (data, labels) in enumerate(loader):
+        # In unit test, we only use a small number of batches
+        if args.truncate_data:
+            if i >= args.truncate_data:
+                break
+
         start = time.time()
         eps_scheduler.step_batch()
         eps = eps_scheduler.get_eps()
@@ -162,7 +147,7 @@ def Train(model, t, loader, eps_scheduler, norm, train, opt, bound_type, method=
             data, labels = data.cuda(), labels.cuda()
             data_lb, data_ub = data_lb.cuda(), data_ub.cuda()
 
-        ptb.eps = eps
+        model.ptb.eps = eps
         # x = BoundedTensor(data, ptb)
         x = data
         if loss_fusion:
@@ -226,7 +211,7 @@ def main(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    model_ori = mlp_3layer()
+    model_ori = models.Models['mlp_3layer_pert']()
 
     epoch = 0
     if args.load:
@@ -258,6 +243,7 @@ def main(args):
     final_name2 = model_loss._modules[final_name1].output_name[0]
     assert type(model._modules[final_name1]) == type(model_loss._modules[final_name2])
     model_loss = BoundDataParallel(model_loss)
+    model_loss.ptb = model.ptb = model_ori.ptb # Perturbation on the parameters
 
     ## Step 4 prepare optimizer, epsilon scheduler and learning rate scheduler
     if args.opt == 'ADAM':
@@ -316,12 +302,8 @@ def main(args):
                 state_dict[name[6:]] = state_dict_loss[name]
 
             with torch.no_grad():
-                if t > int(eps_scheduler.params['start']) + int(eps_scheduler.params['length']):
-                    m = Train(model_loss, t, test_data, eps_scheduler, norm, False, None, args.bound_type,
-                              loss_fusion=False, final_node_name=final_name2)
-                else:
-                    m = Train(model_loss, t, test_data, eps_scheduler, norm, False, None, args.bound_type,
-                              loss_fusion=False, final_node_name=final_name2)
+                m = Train(model_loss, t, test_data, eps_scheduler, norm, False, None, args.bound_type,
+                            loss_fusion=False, final_node_name=final_name2)
 
             save_dict = {'state_dict': state_dict, 'epoch': t, 'optimizer': opt.state_dict()}
             if not os.path.exists('saved_models'):

@@ -2268,10 +2268,10 @@ class BoundGatherElements(Bound):
             if last_A is None:
                 return None
             A = torch.zeros(
-                last_A.shape[0], last_A.shape[1], *x.lower.shape[1:], device=last_A.device)
+                last_A.shape[0], last_A.shape[1], *x.default_shape[1:], device=last_A.device)
             A.scatter_(
                 dim=dim + 1,
-                index=index.lower.unsqueeze(0).repeat(A.shape[0], *([1] * (A.ndim - 1))),
+                index=self.index.unsqueeze(0).repeat(A.shape[0], *([1] * (A.ndim - 1))),
                 src=last_A)
             return A
 
