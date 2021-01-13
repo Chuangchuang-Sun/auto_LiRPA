@@ -57,8 +57,10 @@ parser.add_argument("--bound_opts", type=str, default=None, choices=["same-slope
                     help='bound options')
 parser.add_argument('--clip_grad_norm', type=float, default=8.0)
 parser.add_argument('--truncate_data', type=int, help='Truncate the training/test batches in unit test')
+parser.add_argument('--multigpu', action='store_true', help='MultiGPU training')
 
 
+num_class = 10
 args = parser.parse_args()
 exp_name = 'mlp_MNIST'+'_b'+str(args.batch_size)+'_'+str(args.bound_type)+'_epoch'+str(args.num_epochs)+'_'+args.scheduler_opts+'_'+str(args.eps)[:6]
 if args.verify:
@@ -67,8 +69,8 @@ else:
     logger = Logger(open(exp_name+'.log', "w"))
 
 
+## Training one epoch.
 def Train(model, t, loader, eps_scheduler, norm, train, opt, bound_type, method='robust', loss_fusion=True, final_node_name=None):
-    num_class = 10
     meter = MultiAverageMeter()
     if train:
         model.train()
@@ -78,35 +80,31 @@ def Train(model, t, loader, eps_scheduler, norm, train, opt, bound_type, method=
     else:
         model.eval()
         eps_scheduler.eval()
-
+    
+    # Used for loss-fusion. Get the exp operation in computational graph.
     exp_module = get_exp_module(model)
 
     def get_bound_loss(x=None, c=None):
         if loss_fusion:
+            # When loss fusion is used, we need the upper bound for the final loss function.
             bound_lower, bound_upper = False, True
         else:
+            # When loss fusion is not used, we need the lower bound for the logit layer.
             bound_lower, bound_upper = True, False
 
         if bound_type == 'IBP':
-            lb, ub = model(method_opt="compute_bounds", x=x, IBP=True, C=c, method=None, final_node_name=final_node_name, no_replicas=True)
+            lb, ub = model(method_opt="compute_bounds", x=x, C=c, method="IBP", final_node_name=final_node_name, no_replicas=True)
         elif bound_type == 'CROWN':
-            lb, ub = model(method_opt="compute_bounds", x=x, IBP=False, C=c, method='backward',
+            lb, ub = model(method_opt="compute_bounds", x=x, C=c, method="backward",
                                           bound_lower=bound_lower, bound_upper=bound_upper)
         elif bound_type == 'CROWN-IBP':
-            # lb, ub = model.compute_bounds(ptb=ptb, IBP=True, x=data, C=c, method='backward')  # pure IBP bound
             # we use a mixed IBP and CROWN-IBP bounds, leading to better performance (Zhang et al., ICLR 2020)
             # factor = (eps_scheduler.get_max_eps() - eps_scheduler.get_eps()) / eps_scheduler.get_max_eps()
-            ilb, iub = model(method_opt="compute_bounds", x=x, IBP=True, C=c, method=None, final_node_name=final_node_name, no_replicas=True)
-            # if factor < 1e-50:
-            #     lb, ub = ilb, iub
-            # else:
-            lb, ub = model(method_opt="compute_bounds", IBP=False, C=c, method='backward',
+            ilb, iub = model(method_opt="compute_bounds", x=x, C=c, method="IBP", final_node_name=final_node_name, no_replicas=True)
+            lb, ub = model(method_opt="compute_bounds", C=c, method="CROWN-IBP",
                          bound_lower=bound_lower, bound_upper=bound_upper, final_node_name=final_node_name, average_A=True, no_replicas=True)
-            # if loss_fusion:
-            #     ub = cub * factor + iub * (1 - factor)
-            # else:
-            #     lb = clb * factor + ilb * (1 - factor)
         if loss_fusion:
+            # When loss fusion is enabled, we need to get the common factor before softmax.
             if isinstance(model, BoundDataParallel):
                 max_input = model(get_property=True, node_class=BoundExp, att_name='max_input')
             else:
@@ -120,7 +118,7 @@ def Train(model, t, loader, eps_scheduler, norm, train, opt, bound_type, method=
             return lb, robust_ce
 
     for i, (data, labels) in enumerate(loader):
-        # In unit test, we only use a small number of batches
+        # For unit test. We only use a small number of batches
         if args.truncate_data:
             if i >= args.truncate_data:
                 break
@@ -134,21 +132,11 @@ def Train(model, t, loader, eps_scheduler, norm, train, opt, bound_type, method=
             batch_method = "natural"
         if train:
             opt.zero_grad()
-        # bound input for Linf norm used only
-        if norm == np.inf:
-            data_max = torch.reshape((1. - loader.mean) / loader.std, (1, -1, 1, 1))
-            data_min = torch.reshape((0. - loader.mean) / loader.std, (1, -1, 1, 1))
-            data_ub = torch.min(data + (eps / loader.std).view(1,-1,1,1), data_max)
-            data_lb = torch.max(data - (eps / loader.std).view(1,-1,1,1), data_min)
-        else:
-            data_ub = data_lb = data
 
         if list(model.parameters())[0].is_cuda:
             data, labels = data.cuda(), labels.cuda()
-            data_lb, data_ub = data_lb.cuda(), data_ub.cuda()
 
         model.ptb.eps = eps
-        # x = BoundedTensor(data, ptb)
         x = data
         if loss_fusion:
             if batch_method == 'natural' or not train:
@@ -161,9 +149,10 @@ def Train(model, t, loader, eps_scheduler, norm, train, opt, bound_type, method=
             x = (x, labels)
             c = None
         else:
+            # Generate speicification matrix (when loss fusion is not used).
             c = torch.eye(num_class).type_as(data)[labels].unsqueeze(1) - torch.eye(num_class).type_as(data).unsqueeze(
                 0)
-            # remove specifications to self
+            # remove specifications to self.
             I = (~(labels.data.unsqueeze(1) == torch.arange(num_class).type_as(labels.data).unsqueeze(0)))
             c = (c[I].view(data.size(0), num_class - 1, num_class))
             x = (x, labels)
@@ -211,9 +200,11 @@ def main(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    model_ori = models.Models['mlp_3layer_pert']()
+    ## Load the model with BoundedParameter for weight perturbation.
+    model_ori = models.Models['mlp_3layer_weight_perturb']()
 
     epoch = 0
+    ## Load a checkpoint, if requested.
     if args.load:
         checkpoint = torch.load(args.load)
         epoch, state_dict = checkpoint['epoch'], checkpoint['state_dict']
@@ -239,10 +230,12 @@ def main(args):
     final_name1 = model.final_name
     model_loss = BoundedModule(CrossEntropyWrapper(model_ori), (dummy_input, torch.zeros(1, dtype=torch.long)),
                                bound_opts= { 'relu': args.bound_opts, 'loss_fusion': True }, device=args.device)
+
     # after CrossEntropyWrapper, the final name will change because of one more input node in CrossEntropyWrapper
     final_name2 = model_loss._modules[final_name1].output_name[0]
     assert type(model._modules[final_name1]) == type(model_loss._modules[final_name2])
-    model_loss = BoundDataParallel(model_loss)
+    if args.multigpu:
+        model_loss = BoundDataParallel(model_loss)
     model_loss.ptb = model.ptb = model_ori.ptb # Perturbation on the parameters
 
     ## Step 4 prepare optimizer, epsilon scheduler and learning rate scheduler
@@ -256,7 +249,7 @@ def main(args):
     eps_scheduler = eval(args.scheduler_name)(args.eps, args.scheduler_opts)
     logger.log(str(model_ori))
 
-    # skip epochs
+    # Skip epochs if we continue training from a checkpoint.
     if epoch > 0:
         epoch_length = int((len(train_data.dataset) + train_data.batch_size - 1) / train_data.batch_size)
         eps_scheduler.set_epoch_length(epoch_length)
@@ -273,7 +266,7 @@ def main(args):
             opt.load_state_dict(opt_state)
             logger.log('resume opt_state')
 
-    ## Step 5: start training
+    ## Step 5: start training.
     if args.verify:
         eps_scheduler = FixedScheduler(args.eps)
         with torch.no_grad():
@@ -281,10 +274,12 @@ def main(args):
     else:
         timer = 0.0
         best_loss = 1e10
-        # with torch.autograd.detect_anomaly():
+        # Main training loop
         for t in range(epoch + 1, args.num_epochs+1):
             logger.log("Epoch {}, learning rate {}".format(t, lr_scheduler.get_last_lr()))
             start_time = time.time()
+
+            # Training one epoch
             Train(model_loss, t, train_data, eps_scheduler, norm, True, opt, args.bound_type, loss_fusion=True)
             lr_scheduler.step()
             epoch_time = time.time() - start_time
@@ -294,17 +289,19 @@ def main(args):
             logger.log("Evaluating...")
             torch.cuda.empty_cache()
 
-            # remove 'model.' in state_dict
+            # remove 'model.' in state_dict (hack for saving models so far...)
             state_dict_loss = model_loss.state_dict()
             state_dict = {}
             for name in state_dict_loss:
                 assert (name.startswith('model.'))
                 state_dict[name[6:]] = state_dict_loss[name]
 
+            # Test one epoch.
             with torch.no_grad():
                 m = Train(model_loss, t, test_data, eps_scheduler, norm, False, None, args.bound_type,
                             loss_fusion=False, final_node_name=final_name2)
 
+            # Save checkpoints.
             save_dict = {'state_dict': state_dict, 'epoch': t, 'optimizer': opt.state_dict()}
             if not os.path.exists('saved_models'):
                 os.mkdir('saved_models')
@@ -319,7 +316,6 @@ def main(args):
                     torch.save(save_dict, 'saved_models/' + exp_name)
             else:
                 torch.save(save_dict, 'saved_models/' + exp_name)
-            # del model
             torch.cuda.empty_cache()
 
 

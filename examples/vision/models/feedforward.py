@@ -72,9 +72,9 @@ class mlp_3layer(nn.Module):
         return x
 
 
-class mlp_3layer_pert(nn.Module):
+class mlp_3layer_weight_perturb(nn.Module):
     def __init__(self, in_ch=1, in_dim=28, width=1, pert_weight=True, pert_bias=False, norm=2):
-        super(mlp_3layer_pert, self).__init__()
+        super(mlp_3layer_weight_perturb, self).__init__()
         self.fc1 = nn.Linear(in_ch * in_dim * in_dim, 64 * width)
         self.fc2 = nn.Linear(64 * width, 64 * width)
         self.fc3 = nn.Linear(64 * width, 10)
@@ -93,7 +93,6 @@ class mlp_3layer_pert(nn.Module):
             self.fc3.bias = BoundedParameter(self.fc3.bias.data, self.ptb)
 
     def forward(self, x):
-        # FIXME If change this line to x = x.view(x.size(0), -1), there is an error
         x = x.view(-1, 784)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))

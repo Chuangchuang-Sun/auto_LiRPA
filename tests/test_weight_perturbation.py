@@ -51,7 +51,7 @@ class TestWeightPerturbation(TestCase):
     def test_perturbation(self):
         np.random.seed(123) # FIXME This seed is inconsistent with other seeds (1234)
 
-        model_ori = models.Models['mlp_3layer_pert'](pert_weight=True, pert_bias=True).eval()
+        model_ori = models.Models['mlp_3layer_weight_perturb'](pert_weight=True, pert_bias=True).eval()
         self.result['model'] = model_ori.state_dict()
         self.result['data'] = torch.randn(8, 1, 28, 28)
         model_ori.load_state_dict(self.result['model'])
@@ -66,7 +66,7 @@ class TestWeightPerturbation(TestCase):
         assert torch.isclose(model_ori(dummy_input), model_ori(dummy_input), 1e-8).all()
 
         def verify_model(pert_weight=True, pert_bias=True, norm=np.inf, lb_name='', ub_name=''):
-            model_ori_ = models.Models['mlp_3layer_pert'](pert_weight=pert_weight, pert_bias=pert_bias, norm=norm).eval()
+            model_ori_ = models.Models['mlp_3layer_weight_perturb'](pert_weight=pert_weight, pert_bias=pert_bias, norm=norm).eval()
             model_ori_.load_state_dict(state_dict)
             model_ = BoundedModule(model_ori_, inputs)
             model_.ptb = model_ori.ptb
